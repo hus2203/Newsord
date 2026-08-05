@@ -4,6 +4,7 @@ import os
 import random
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -16,6 +17,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 logging.basicConfig(level=logging.INFO)
 
@@ -46,6 +49,18 @@ def init_db():
             en TEXT NOT NULL,
             level INTEGER NOT NULL DEFAULT 0,
             correct_streak INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            user_id INTEGER PRIMARY KEY,
+            chat_id INTEGER NOT NULL,
+            reminders_enabled INTEGER NOT NULL DEFAULT 0,
+            interval_minutes INTEGER NOT NULL DEFAULT 15,
+            last_sent_at TEXT,
+            last_word_id INTEGER
         )
         """
     )
@@ -116,6 +131,71 @@ def update_progress(word_id: int, correct: bool) -> None:
     conn.close()
 
 
+def set_reminders(user_id: int, chat_id: int, enabled: bool, interval_minutes: int | None = None) -> None:
+    conn = get_conn()
+    if interval_minutes is None:
+        conn.execute(
+            """INSERT INTO settings (user_id, chat_id, reminders_enabled)
+               VALUES (?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   chat_id = excluded.chat_id,
+                   reminders_enabled = excluded.reminders_enabled""",
+            (user_id, chat_id, int(enabled)),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO settings (user_id, chat_id, reminders_enabled, interval_minutes)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   chat_id = excluded.chat_id,
+                   reminders_enabled = excluded.reminders_enabled,
+                   interval_minutes = excluded.interval_minutes""",
+            (user_id, chat_id, int(enabled), interval_minutes),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_all_reminder_users() -> list[tuple[int, int, int, str | None]]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT user_id, chat_id, interval_minutes, last_sent_at FROM settings WHERE reminders_enabled = 1"
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def mark_reminder_sent(user_id: int) -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE settings SET last_sent_at = ? WHERE user_id = ?",
+        (datetime.utcnow().isoformat(), user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_last_word(user_id: int, word_id: int) -> None:
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO settings (user_id, chat_id, last_word_id)
+           VALUES (?, 0, ?)
+           ON CONFLICT(user_id) DO UPDATE SET last_word_id = excluded.last_word_id""",
+        (user_id, word_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_last_word_id(user_id: int) -> int | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT last_word_id FROM settings WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
 # --------------------------------------------------------------------------
 # FSM состояния
 # --------------------------------------------------------------------------
@@ -140,7 +220,9 @@ async def cmd_start(message: Message) -> None:
         "/add — добавить слово\n"
         "/mywords — список твоих слов\n"
         "/del <id> — удалить слово\n"
-        "/learn — начать тренировку\n"
+        "/learn — начать тренировку (случайно рус→англ или англ→рус)\n"
+        "/remind_on <минуты> — присылать слово через заданный интервал (по умолчанию 15)\n"
+        "/remind_off — выключить напоминания\n"
         "/stop — прервать текущее действие"
     )
 
@@ -205,30 +287,55 @@ async def cmd_del(message: Message) -> None:
 # Тренировка
 # --------------------------------------------------------------------------
 
-def pick_word(words: list[Word]) -> Word:
-    # Слова с более низким уровнем встречаются чаще
-    weights = [max(6 - w.level, 1) for w in words]
-    return random.choices(words, weights=weights, k=1)[0]
+def pick_word(words: list[Word], user_id: int) -> Word:
+    # Не повторяем подряд то же слово, если есть из чего выбрать
+    last_id = get_last_word_id(user_id)
+    candidates = words
+    if len(words) > 1 and last_id is not None:
+        candidates = [w for w in words if w.id != last_id] or words
+
+    # Слова с более низким уровнем встречаются немного чаще, но не подавляют остальные
+    weights = [max(4 - w.level, 1) for w in candidates]
+    chosen = random.choices(candidates, weights=weights, k=1)[0]
+    set_last_word(user_id, chosen.id)
+    return chosen
 
 
-async def send_quiz(message: Message, state: FSMContext, words: list[Word], target: Word) -> None:
+def pick_direction() -> str:
+    return random.choice(["ru2en", "en2ru"])
+
+
+async def send_quiz(message: Message, state: FSMContext, words: list[Word], target: Word, direction: str) -> None:
     distractors = [w for w in words if w.id != target.id]
     random.shuffle(distractors)
     options = [target] + distractors[:3]
     random.shuffle(options)
 
+    if direction == "ru2en":
+        question = target.ru
+        option_text = lambda w: w.en
+    else:
+        question = target.en
+        option_text = lambda w: w.ru
+
     buttons = [
-        [InlineKeyboardButton(text=w.en, callback_data=f"quiz:{target.id}:{w.id}")]
+        [InlineKeyboardButton(text=option_text(w), callback_data=f"quiz:{target.id}:{w.id}")]
         for w in options
     ]
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer(f"Как переводится «{target.ru}»?", reply_markup=kb)
+    await message.answer(f"Как переводится «{question}»?", reply_markup=kb)
 
 
-async def send_flashcard(message: Message, state: FSMContext, target: Word) -> None:
+async def send_flashcard(message: Message, state: FSMContext, target: Word, direction: str) -> None:
     await state.set_state(Learn.waiting_flashcard_answer)
-    await state.update_data(target_id=target.id, target_en=target.en)
-    await message.answer(f"Переведи слово: «{target.ru}»\n(напиши ответ текстом)")
+    if direction == "ru2en":
+        question, expected = target.ru, target.en
+        hint = "на английский"
+    else:
+        question, expected = target.en, target.ru
+        hint = "на русский"
+    await state.update_data(target_id=target.id, expected=expected)
+    await message.answer(f"Переведи слово ({hint}): «{question}»\n(напиши ответ текстом)")
 
 
 @router.message(Command("learn"))
@@ -238,12 +345,37 @@ async def cmd_learn(message: Message, state: FSMContext) -> None:
         await message.answer("Сначала добавь хотя бы одно слово через /add")
         return
 
-    target = pick_word(words)
+    target = pick_word(words, message.from_user.id)
+    direction = pick_direction()
 
     if len(words) >= 4 and random.random() < 0.7:
-        await send_quiz(message, state, words, target)
+        await send_quiz(message, state, words, target, direction)
     else:
-        await send_flashcard(message, state, target)
+        await send_flashcard(message, state, target, direction)
+
+
+@router.message(Command("remind_on"))
+async def cmd_remind_on(message: Message) -> None:
+    parts = (message.text or "").split()
+    interval = 15
+    if len(parts) == 2:
+        if not parts[1].isdigit() or not (1 <= int(parts[1]) <= 1440):
+            await message.answer("Интервал укажи числом минут от 1 до 1440, например: /remind_on 40")
+            return
+        interval = int(parts[1])
+
+    set_reminders(message.from_user.id, message.chat.id, True, interval)
+    await message.answer(
+        f"Включил напоминания — буду присылать слово каждые {interval} мин ⏰\n"
+        "Изменить интервал: /remind_on <минуты> (например /remind_on 1 или /remind_on 40)\n"
+        "Выключить: /remind_off"
+    )
+
+
+@router.message(Command("remind_off"))
+async def cmd_remind_off(message: Message) -> None:
+    set_reminders(message.from_user.id, message.chat.id, False)
+    await message.answer("Выключил напоминания.")
 
 
 @router.callback_query(F.data.startswith("quiz:"))
@@ -274,18 +406,83 @@ async def process_quiz_answer(callback: CallbackQuery) -> None:
 async def process_flashcard_answer(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     target_id = data["target_id"]
-    target_en = data["target_en"]
+    expected = data["expected"]
     user_answer = (message.text or "").strip().lower()
 
-    correct = user_answer == target_en
+    correct = user_answer == expected
     update_progress(target_id, correct)
     await state.clear()
 
     if correct:
         await message.answer("✅ Верно!")
     else:
-        await message.answer(f"❌ Неверно. Правильный ответ: {target_en}")
+        await message.answer(f"❌ Неверно. Правильный ответ: {expected}")
     await message.answer("Ещё раз? /learn")
+
+
+# --------------------------------------------------------------------------
+# Периодические напоминания
+# --------------------------------------------------------------------------
+
+async def send_reminder(bot: Bot, user_id: int, chat_id: int) -> None:
+    words = get_words(user_id)
+    if not words:
+        return
+    target = pick_word(words, user_id)
+    direction = pick_direction()
+
+    if len(words) >= 4 and random.random() < 0.7:
+        distractors = [w for w in words if w.id != target.id]
+        random.shuffle(distractors)
+        options = [target] + distractors[:3]
+        random.shuffle(options)
+
+        if direction == "ru2en":
+            question = target.ru
+            option_text = lambda w: w.en
+        else:
+            question = target.en
+            option_text = lambda w: w.ru
+
+        buttons = [
+            [InlineKeyboardButton(text=option_text(w), callback_data=f"quiz:{target.id}:{w.id}")]
+            for w in options
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await bot.send_message(chat_id, f"⏰ Как переводится «{question}»?", reply_markup=kb)
+    else:
+        question = target.ru if direction == "ru2en" else target.en
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="Показать ответ", callback_data=f"reveal:{target.id}")]]
+        )
+        await bot.send_message(chat_id, f"⏰ Переведи слово: «{question}»", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("reveal:"))
+async def process_reveal(callback: CallbackQuery) -> None:
+    word_id = int(callback.data.split(":")[1])
+    conn = get_conn()
+    row = conn.execute("SELECT ru, en FROM words WHERE id = ?", (word_id,)).fetchone()
+    conn.close()
+    if row:
+        await callback.message.edit_text(f"{row[0]} — {row[1]}")
+    await callback.answer()
+
+
+async def reminder_tick(bot: Bot) -> None:
+    now = datetime.utcnow()
+    for user_id, chat_id, interval_minutes, last_sent_at in get_all_reminder_users():
+        due = True
+        if last_sent_at:
+            elapsed = now - datetime.fromisoformat(last_sent_at)
+            due = elapsed >= timedelta(minutes=interval_minutes)
+        if not due:
+            continue
+        try:
+            await send_reminder(bot, user_id, chat_id)
+            mark_reminder_sent(user_id)
+        except Exception:
+            logging.exception("Ошибка при отправке напоминания user_id=%s", user_id)
 
 
 # --------------------------------------------------------------------------
@@ -297,6 +494,11 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(reminder_tick, IntervalTrigger(minutes=1), args=[bot])
+    scheduler.start()
+
     await dp.start_polling(bot)
 
 
