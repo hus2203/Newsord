@@ -16,7 +16,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -32,6 +34,7 @@ router = Router()
 # Заполняется в main(); используется, чтобы создавать FSM-состояние
 # из фоновых задач (напоминаний), где нет входящего Message.
 STORAGE: MemoryStorage | None = None
+SCHEDULER: AsyncIOScheduler | None = None
 
 
 # --------------------------------------------------------------------------
@@ -287,6 +290,74 @@ class TrackChatMiddleware(BaseMiddleware):
 
 
 # --------------------------------------------------------------------------
+# Планировщик: персональный таймер на каждого пользователя (без дрейфа)
+# --------------------------------------------------------------------------
+
+def _reminder_job_id(user_id: int) -> str:
+    return f"reminder_{user_id}"
+
+
+def schedule_user_reminder(bot: Bot, user_id: int, chat_id: int, interval_minutes: int) -> None:
+    if SCHEDULER is None:
+        return
+    SCHEDULER.add_job(
+        send_reminder,
+        IntervalTrigger(minutes=interval_minutes),
+        args=[bot, user_id, chat_id],
+        id=_reminder_job_id(user_id),
+        replace_existing=True,
+    )
+
+
+def unschedule_user_reminder(user_id: int) -> None:
+    if SCHEDULER is None:
+        return
+    job_id = _reminder_job_id(user_id)
+    if SCHEDULER.get_job(job_id):
+        SCHEDULER.remove_job(job_id)
+
+
+# --------------------------------------------------------------------------
+# Клавиатура с кнопками вместо команд
+# --------------------------------------------------------------------------
+
+BTN_ADD = "➕ Добавить слово"
+BTN_WORDS = "📚 Мои слова"
+BTN_LEARN = "🎯 Тренировка"
+BTN_REMIND = "⏰ Напоминания"
+BTN_STATS = "📊 Статистика"
+BTN_STOP = "🛑 Стоп"
+
+
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_ADD), KeyboardButton(text=BTN_WORDS)],
+            [KeyboardButton(text=BTN_LEARN), KeyboardButton(text=BTN_STATS)],
+            [KeyboardButton(text=BTN_REMIND), KeyboardButton(text=BTN_STOP)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def remind_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="1 мин", callback_data="remind_set:1"),
+                InlineKeyboardButton(text="5 мин", callback_data="remind_set:5"),
+                InlineKeyboardButton(text="15 мин", callback_data="remind_set:15"),
+            ],
+            [
+                InlineKeyboardButton(text="30 мин", callback_data="remind_set:30"),
+                InlineKeyboardButton(text="60 мин", callback_data="remind_set:60"),
+            ],
+            [InlineKeyboardButton(text="🔕 Выключить", callback_data="remind_set:off")],
+        ]
+    )
+
+
+# --------------------------------------------------------------------------
 # FSM состояния
 # --------------------------------------------------------------------------
 
@@ -305,32 +376,52 @@ class Learn(StatesGroup):
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
-        "Привет! Я бот для изучения английских слов 🇷🇺➡️🇬🇧\n\n"
-        "Команды:\n"
+        "Привет! Я бот для изучения английских слов 🇷🇺⇄🇬🇧\n\n"
+        "Пользуйся кнопками внизу экрана — команды печатать не обязательно 👇\n\n"
+        "Также доступны команды:\n"
         "/add — добавить слово\n"
         "/mywords — список твоих слов\n"
         "/del <id> — удалить слово\n"
         "/learn — начать тренировку (случайно рус→англ или англ→рус)\n"
-        "/remind_on <минуты> — присылать слово через заданный интервал (по умолчанию 15)\n"
+        "/remind_on <минуты> — присылать слово через заданный интервал\n"
         "/remind_off — выключить напоминания\n"
         "/stats — отчёт за последние сутки\n"
-        "/stop — прервать текущее действие"
+        "/stop — прервать текущее действие",
+        reply_markup=main_menu_kb(),
     )
+
+
+async def do_stop(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Хорошо, остановились. Выбери действие на кнопках ниже 👇", reply_markup=main_menu_kb())
 
 
 @router.message(Command("stop"))
 async def cmd_stop(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer("Хорошо, остановились. Набери /learn или /add, когда будешь готов.")
+    await do_stop(message, state)
 
 
-@router.message(Command("add"))
-async def cmd_add(message: Message, state: FSMContext) -> None:
+@router.message(F.text == BTN_STOP)
+async def btn_stop(message: Message, state: FSMContext) -> None:
+    await do_stop(message, state)
+
+
+async def do_add(message: Message, state: FSMContext) -> None:
     await state.set_state(AddWord.waiting_pair)
     await message.answer(
         "Отправь слово в формате:\nслово_на_русском - слово_на_английском\n\n"
         "Например: яблоко - apple"
     )
+
+
+@router.message(Command("add"))
+async def cmd_add(message: Message, state: FSMContext) -> None:
+    await do_add(message, state)
+
+
+@router.message(F.text == BTN_ADD)
+async def btn_add(message: Message, state: FSMContext) -> None:
+    await do_add(message, state)
 
 
 @router.message(AddWord.waiting_pair)
@@ -348,11 +439,10 @@ async def process_add_word(message: Message, state: FSMContext) -> None:
         return
     add_word(message.from_user.id, ru, en)
     await state.clear()
-    await message.answer(f"Добавил: {ru} — {en} ✅\nМожешь добавить ещё через /add или начать /learn")
+    await message.answer(f"Добавил: {ru} — {en} ✅\nМожешь добавить ещё или начать тренировку.")
 
 
-@router.message(Command("mywords"))
-async def cmd_mywords(message: Message) -> None:
+async def do_mywords(message: Message) -> None:
     words = get_words(message.from_user.id)
     if not words:
         await message.answer("Пока нет слов. Добавь через /add")
@@ -361,8 +451,17 @@ async def cmd_mywords(message: Message) -> None:
     await message.answer("Твои слова:\n" + "\n".join(lines))
 
 
-@router.message(Command("stats"))
-async def cmd_stats(message: Message) -> None:
+@router.message(Command("mywords"))
+async def cmd_mywords(message: Message) -> None:
+    await do_mywords(message)
+
+
+@router.message(F.text == BTN_WORDS)
+async def btn_mywords(message: Message) -> None:
+    await do_mywords(message)
+
+
+async def do_stats(message: Message) -> None:
     since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
     stats = {uid: (total, correct) for uid, total, correct in get_daily_stats(since)}
     total, correct = stats.get(message.from_user.id, (0, 0))
@@ -374,6 +473,16 @@ async def cmd_stats(message: Message) -> None:
         lines = [f"— {w.ru} — {w.en} (ошибок: {w.mistakes})" for w in mistaken]
         text += "\n\nЧаще всего путаешь:\n" + "\n".join(lines)
     await message.answer(text)
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    await do_stats(message)
+
+
+@router.message(F.text == BTN_STATS)
+async def btn_stats(message: Message) -> None:
+    await do_stats(message)
 
 
 @router.message(Command("del"))
@@ -446,6 +555,15 @@ async def send_flashcard(message: Message, state: FSMContext, target: Word, dire
 
 @router.message(Command("learn"))
 async def cmd_learn(message: Message, state: FSMContext) -> None:
+    await do_learn(message, state)
+
+
+@router.message(F.text == BTN_LEARN)
+async def btn_learn(message: Message, state: FSMContext) -> None:
+    await do_learn(message, state)
+
+
+async def do_learn(message: Message, state: FSMContext) -> None:
     words = get_words(message.from_user.id)
     if not words:
         await message.answer("Сначала добавь хотя бы одно слово через /add")
@@ -471,9 +589,10 @@ async def cmd_remind_on(message: Message) -> None:
         interval = int(parts[1])
 
     set_reminders(message.from_user.id, message.chat.id, True, interval)
+    schedule_user_reminder(message.bot, message.from_user.id, message.chat.id, interval)
     await message.answer(
         f"Включил напоминания — буду присылать слово каждые {interval} мин ⏰\n"
-        "Изменить интервал: /remind_on <минуты> (например /remind_on 1 или /remind_on 40)\n"
+        "Изменить интервал: /remind_on <минуты> или кнопкой ⏰ Напоминания\n"
         "Выключить: /remind_off"
     )
 
@@ -481,7 +600,31 @@ async def cmd_remind_on(message: Message) -> None:
 @router.message(Command("remind_off"))
 async def cmd_remind_off(message: Message) -> None:
     set_reminders(message.from_user.id, message.chat.id, False)
+    unschedule_user_reminder(message.from_user.id)
     await message.answer("Выключил напоминания.")
+
+
+@router.message(F.text == BTN_REMIND)
+async def btn_remind_menu(message: Message) -> None:
+    await message.answer("Как часто присылать слова?", reply_markup=remind_menu_kb())
+
+
+@router.callback_query(F.data.startswith("remind_set:"))
+async def process_remind_set(callback: CallbackQuery) -> None:
+    value = callback.data.split(":")[1]
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+
+    if value == "off":
+        set_reminders(user_id, chat_id, False)
+        unschedule_user_reminder(user_id)
+        await callback.message.edit_text("🔕 Напоминания выключены.")
+    else:
+        interval = int(value)
+        set_reminders(user_id, chat_id, True, interval)
+        schedule_user_reminder(callback.bot, user_id, chat_id, interval)
+        await callback.message.edit_text(f"⏰ Включил напоминания каждые {interval} мин.")
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("quiz:"))
@@ -575,22 +718,6 @@ async def send_reminder(bot: Bot, user_id: int, chat_id: int) -> None:
         )
 
 
-async def reminder_tick(bot: Bot) -> None:
-    now = datetime.utcnow()
-    for user_id, chat_id, interval_minutes, last_sent_at in get_all_reminder_users():
-        due = True
-        if last_sent_at:
-            elapsed = now - datetime.fromisoformat(last_sent_at)
-            due = elapsed >= timedelta(minutes=interval_minutes)
-        if not due:
-            continue
-        try:
-            await send_reminder(bot, user_id, chat_id)
-            mark_reminder_sent(user_id)
-        except Exception:
-            logging.exception("Ошибка при отправке напоминания user_id=%s", user_id)
-
-
 async def daily_report_tick(bot: Bot) -> None:
     since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
     for user_id, total, correct_sum in get_daily_stats(since):
@@ -617,7 +744,7 @@ async def daily_report_tick(bot: Bot) -> None:
 # --------------------------------------------------------------------------
 
 async def main() -> None:
-    global STORAGE
+    global STORAGE, SCHEDULER
     init_db()
     bot = Bot(token=BOT_TOKEN)
     STORAGE = MemoryStorage()
@@ -625,10 +752,14 @@ async def main() -> None:
     dp.update.outer_middleware(TrackChatMiddleware())
     dp.include_router(router)
 
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(reminder_tick, IntervalTrigger(minutes=1), args=[bot])
-    scheduler.add_job(daily_report_tick, CronTrigger(hour=0, minute=0), args=[bot])
-    scheduler.start()
+    SCHEDULER = AsyncIOScheduler()
+
+    # Восстанавливаем персональные напоминания для тех, у кого они уже были включены
+    for user_id, chat_id, interval_minutes, _ in get_all_reminder_users():
+        schedule_user_reminder(bot, user_id, chat_id, interval_minutes)
+
+    SCHEDULER.add_job(daily_report_tick, CronTrigger(hour=0, minute=0), args=[bot])
+    SCHEDULER.start()
 
     await dp.start_polling(bot)
 
