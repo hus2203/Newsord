@@ -6,10 +6,11 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
@@ -18,6 +19,7 @@ from aiogram.types import (
     Message,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +28,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
 DB_PATH = os.path.join(os.path.dirname(__file__), "wordbot.db")
 
 router = Router()
+
+# Заполняется в main(); используется, чтобы создавать FSM-состояние
+# из фоновых задач (напоминаний), где нет входящего Message.
+STORAGE: MemoryStorage | None = None
 
 
 # --------------------------------------------------------------------------
@@ -48,7 +54,19 @@ def init_db():
             ru TEXT NOT NULL,
             en TEXT NOT NULL,
             level INTEGER NOT NULL DEFAULT 0,
-            correct_streak INTEGER NOT NULL DEFAULT 0
+            correct_streak INTEGER NOT NULL DEFAULT 0,
+            mistakes INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS answers_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            word_id INTEGER NOT NULL,
+            correct INTEGER NOT NULL,
+            answered_at TEXT NOT NULL
         )
         """
     )
@@ -64,6 +82,10 @@ def init_db():
         )
         """
     )
+    # На случай обновления бота на уже существующей базе — добьём недостающую колонку
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(words)").fetchall()}
+    if "mistakes" not in existing_cols:
+        conn.execute("ALTER TABLE words ADD COLUMN mistakes INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     conn.close()
 
@@ -76,6 +98,7 @@ class Word:
     en: str
     level: int
     correct_streak: int
+    mistakes: int
 
 
 def add_word(user_id: int, ru: str, en: str) -> None:
@@ -91,7 +114,7 @@ def add_word(user_id: int, ru: str, en: str) -> None:
 def get_words(user_id: int) -> list[Word]:
     conn = get_conn()
     rows = conn.execute(
-        "SELECT id, user_id, ru, en, level, correct_streak FROM words WHERE user_id = ?",
+        "SELECT id, user_id, ru, en, level, correct_streak, mistakes FROM words WHERE user_id = ?",
         (user_id,),
     ).fetchall()
     conn.close()
@@ -109,7 +132,7 @@ def delete_word(user_id: int, word_id: int) -> bool:
     return deleted
 
 
-def update_progress(word_id: int, correct: bool) -> None:
+def update_progress(user_id: int, word_id: int, correct: bool) -> None:
     conn = get_conn()
     if correct:
         conn.execute(
@@ -123,10 +146,15 @@ def update_progress(word_id: int, correct: bool) -> None:
         conn.execute(
             """UPDATE words
                SET correct_streak = 0,
-                   level = MAX(level - 1, 0)
+                   level = MAX(level - 1, 0),
+                   mistakes = mistakes + 1
                WHERE id = ?""",
             (word_id,),
         )
+    conn.execute(
+        "INSERT INTO answers_log (user_id, word_id, correct, answered_at) VALUES (?, ?, ?, ?)",
+        (user_id, word_id, int(correct), datetime.utcnow().isoformat()),
+    )
     conn.commit()
     conn.close()
 
@@ -196,6 +224,68 @@ def get_last_word_id(user_id: int) -> int | None:
     return row[0] if row else None
 
 
+def upsert_chat_id(user_id: int, chat_id: int) -> None:
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO settings (user_id, chat_id)
+           VALUES (?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id""",
+        (user_id, chat_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_chat_id(user_id: int) -> int | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT chat_id FROM settings WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_daily_stats(since_iso: str) -> list[tuple[int, int, int]]:
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT user_id, COUNT(*), SUM(correct)
+           FROM answers_log
+           WHERE answered_at >= ?
+           GROUP BY user_id""",
+        (since_iso,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_top_mistakes(user_id: int, limit: int = 5) -> list[Word]:
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT id, user_id, ru, en, level, correct_streak, mistakes
+           FROM words WHERE user_id = ? AND mistakes > 0
+           ORDER BY mistakes DESC LIMIT ?""",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return [Word(*row) for row in rows]
+
+
+# --------------------------------------------------------------------------
+# Middleware: запоминаем chat_id при любом обращении
+# --------------------------------------------------------------------------
+
+class TrackChatMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        chat = data.get("event_chat")
+        if user is not None and chat is not None:
+            try:
+                upsert_chat_id(user.id, chat.id)
+            except Exception:
+                logging.exception("Не удалось сохранить chat_id")
+        return await handler(event, data)
+
+
 # --------------------------------------------------------------------------
 # FSM состояния
 # --------------------------------------------------------------------------
@@ -223,6 +313,7 @@ async def cmd_start(message: Message) -> None:
         "/learn — начать тренировку (случайно рус→англ или англ→рус)\n"
         "/remind_on <минуты> — присылать слово через заданный интервал (по умолчанию 15)\n"
         "/remind_off — выключить напоминания\n"
+        "/stats — отчёт за последние сутки\n"
         "/stop — прервать текущее действие"
     )
 
@@ -270,6 +361,21 @@ async def cmd_mywords(message: Message) -> None:
     await message.answer("Твои слова:\n" + "\n".join(lines))
 
 
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    stats = {uid: (total, correct) for uid, total, correct in get_daily_stats(since)}
+    total, correct = stats.get(message.from_user.id, (0, 0))
+    wrong = total - correct
+    mistaken = get_top_mistakes(message.from_user.id, limit=5)
+
+    text = f"📊 За последние 24 часа:\nВсего ответов: {total}\n✅ Правильно: {correct}\n❌ Ошибок: {wrong}"
+    if mistaken:
+        lines = [f"— {w.ru} — {w.en} (ошибок: {w.mistakes})" for w in mistaken]
+        text += "\n\nЧаще всего путаешь:\n" + "\n".join(lines)
+    await message.answer(text)
+
+
 @router.message(Command("del"))
 async def cmd_del(message: Message) -> None:
     parts = (message.text or "").split()
@@ -294,8 +400,8 @@ def pick_word(words: list[Word], user_id: int) -> Word:
     if len(words) > 1 and last_id is not None:
         candidates = [w for w in words if w.id != last_id] or words
 
-    # Слова с более низким уровнем встречаются немного чаще, но не подавляют остальные
-    weights = [max(4 - w.level, 1) for w in candidates]
+    # Слова с более низким уровнем и с историей ошибок встречаются чаще
+    weights = [max((4 - w.level) + w.mistakes * 2, 1) for w in candidates]
     chosen = random.choices(candidates, weights=weights, k=1)[0]
     set_last_word(user_id, chosen.id)
     return chosen
@@ -390,7 +496,7 @@ async def process_quiz_answer(callback: CallbackQuery) -> None:
         return
 
     correct = target_id == chosen_id
-    update_progress(target_id, correct)
+    update_progress(callback.from_user.id, target_id, correct)
 
     if correct:
         await callback.message.edit_text(f"✅ Верно! {target.ru} — {target.en}")
@@ -410,7 +516,7 @@ async def process_flashcard_answer(message: Message, state: FSMContext) -> None:
     user_answer = (message.text or "").strip().lower()
 
     correct = user_answer == expected
-    update_progress(target_id, correct)
+    update_progress(message.from_user.id, target_id, correct)
     await state.clear()
 
     if correct:
@@ -451,22 +557,22 @@ async def send_reminder(bot: Bot, user_id: int, chat_id: int) -> None:
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
         await bot.send_message(chat_id, f"⏰ Как переводится «{question}»?", reply_markup=kb)
     else:
-        question = target.ru if direction == "ru2en" else target.en
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="Показать ответ", callback_data=f"reveal:{target.id}")]]
+        if direction == "ru2en":
+            question, expected = target.ru, target.en
+            hint = "на английский"
+        else:
+            question, expected = target.en, target.ru
+            hint = "на русский"
+
+        if STORAGE is not None:
+            key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
+            state = FSMContext(storage=STORAGE, key=key)
+            await state.set_state(Learn.waiting_flashcard_answer)
+            await state.update_data(target_id=target.id, expected=expected)
+
+        await bot.send_message(
+            chat_id, f"⏰ Переведи слово ({hint}): «{question}»\n(напиши ответ текстом)"
         )
-        await bot.send_message(chat_id, f"⏰ Переведи слово: «{question}»", reply_markup=kb)
-
-
-@router.callback_query(F.data.startswith("reveal:"))
-async def process_reveal(callback: CallbackQuery) -> None:
-    word_id = int(callback.data.split(":")[1])
-    conn = get_conn()
-    row = conn.execute("SELECT ru, en FROM words WHERE id = ?", (word_id,)).fetchone()
-    conn.close()
-    if row:
-        await callback.message.edit_text(f"{row[0]} — {row[1]}")
-    await callback.answer()
 
 
 async def reminder_tick(bot: Bot) -> None:
@@ -485,18 +591,43 @@ async def reminder_tick(bot: Bot) -> None:
             logging.exception("Ошибка при отправке напоминания user_id=%s", user_id)
 
 
+async def daily_report_tick(bot: Bot) -> None:
+    since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    for user_id, total, correct_sum in get_daily_stats(since):
+        correct = correct_sum or 0
+        wrong = total - correct
+        chat_id = get_chat_id(user_id)
+        if chat_id is None or total == 0:
+            continue
+
+        text = f"📊 Отчёт за сутки:\nВсего ответов: {total}\n✅ Правильно: {correct}\n❌ Ошибок: {wrong}"
+        mistaken = get_top_mistakes(user_id, limit=5)
+        if mistaken:
+            lines = [f"— {w.ru} — {w.en} (ошибок: {w.mistakes})" for w in mistaken]
+            text += "\n\nЧаще всего путаешь:\n" + "\n".join(lines)
+
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception:
+            logging.exception("Не удалось отправить отчёт user_id=%s", user_id)
+
+
 # --------------------------------------------------------------------------
 # Запуск
 # --------------------------------------------------------------------------
 
 async def main() -> None:
+    global STORAGE
     init_db()
     bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
+    STORAGE = MemoryStorage()
+    dp = Dispatcher(storage=STORAGE)
+    dp.update.outer_middleware(TrackChatMiddleware())
     dp.include_router(router)
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(reminder_tick, IntervalTrigger(minutes=1), args=[bot])
+    scheduler.add_job(daily_report_tick, CronTrigger(hour=0, minute=0), args=[bot])
     scheduler.start()
 
     await dp.start_polling(bot)
